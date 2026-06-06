@@ -72,7 +72,7 @@ usage() {
 用法:
   sudo $0             打开交互管理菜单
   sudo $0 status      查看服务状态
-  sudo $0 expire      立即禁用已到期的临时账户
+  sudo $0 expire      清理已过期的临时账户
   sudo $0 repair-webdav  按当前协议模式重建全部 WebDAV 配置
   sudo $0 purge-all   purge 全部协议和账户，保留数据目录
 EOF
@@ -123,9 +123,9 @@ read_password() {
   local text="$1" first="" second=""
   while true; do
     printf '%s' "$text" >&2
-    read -rs first
+    IFS= read -rs first
     printf '\n请再次输入确认: ' >&2
-    read -rs second
+    IFS= read -rs second
     printf '\n' >&2
     [ -n "$first" ] || { warn "密码不能为空。"; continue; }
     [ "$first" = "$second" ] || { warn "两次输入不一致。"; continue; }
@@ -233,7 +233,7 @@ is_managed() {
 }
 
 migrate_managed_ownership() {
-  local protocol file user group USER GROUP
+  local protocol file user group USER GROUP SHARE CHROOT DATA_DIR AUTH_MODE ROOT PORT TEMPORARY EXPIRES_AT
   for protocol in ftp sftp; do
     for file in "${ACCOUNT_DIR}/${protocol}"/*.env; do
       [ -f "$file" ] || continue
@@ -1200,6 +1200,7 @@ add_ftp() {
   save_ftp_service; render_vsftpd_config; set_firewall_port add "$FTP_PORT"
   set_ftp_passive_firewall add
   commit_account_transaction
+  warn "注意：当前的 FTP 配置未开启加密，用户的密码和数据将在网络上明文传输。"
   warn "FTP 账户默认无密码且已锁定；请在“管理 FTP 密码”中设置密码后登录。"
 }
 
@@ -1336,7 +1337,7 @@ render_webdav_share() {
     return
   fi
   load_account webdav "$account"
-  port="$PORT"; root="$ROOT"; auth="$(webdav_auth_file "$share")"; lock="/var/lock/${APP}"
+  port="$PORT"; root="$ROOT"; auth="$(webdav_auth_file "$share")"; lock="${STATE_DIR}/davlock"
   normalize_webdav_share_port "$share" "$port"
   prepare_shared_dir "$APACHE_USER" "$root"
   mkdir -p "$lock"; chown "$APACHE_USER:$APACHE_USER" "$lock"; chmod 750 "$lock"
@@ -1386,7 +1387,7 @@ rebuild_webdav_auth_file() {
     legacy="${STATE_DIR}/webdav-${USER}.htpasswd"
     [ -f "$source" ] || [ ! -f "$legacy" ] || install -o root -g "$APACHE_USER" -m 640 "$legacy" "$source"
   done < <(find_webdav_share_account "$share")
-  temp="$(mktemp)"
+  temp="$(mktemp "${STATE_DIR}/.webdav_auth.XXXXXX")"
   while IFS= read -r account; do
     load_account webdav "$account"
     account_active || continue
@@ -1464,7 +1465,7 @@ find_webdav_port() {
 
 write_webdav_password_file() {
   local auth="$1" user="$2" password="$3" temp
-  temp="$(mktemp)"
+  temp="$(mktemp "${STATE_DIR}/.webdav_auth.XXXXXX")"
   printf '%s\n' "$password" | htpasswd -ci "$temp" "$user" >/dev/null ||
     { rm -f "$temp"; die "WebDAV 用户 ${user} 的认证文件创建失败。"; }
   printf '%s\n' "$password" | htpasswd -vi "$temp" "$user" >/dev/null ||
@@ -1503,6 +1504,7 @@ add_webdav() {
   configure_selinux_port http_port_t "$port"
   refresh_webdav_share "$share"; set_firewall_port add "$port"
   commit_account_transaction
+  [ "$WEBDAV_TLS" = 1 ] || warn "注意：当前的 WebDAV 未开启 TLS 加密，将使用 Basic Auth 进行明文传输密码和数据。"
   log "WebDAV 账户已新增: $(webdav_scheme)://$(server_address):${port}/"
 }
 
@@ -1658,26 +1660,44 @@ expire_temporary_accounts() {
       account_expired "${EXPIRES_AT:-0}" || continue
       case "$protocol" in
         sftp)
-          lock_password "$USER"; rm -f "${AUTHORIZED_KEYS_DIR}/${USER}"; sftp_changed=1
+          remove_user_and_group "$USER" "$GROUP" sftp; rm -f "${AUTHORIZED_KEYS_DIR}/${USER}" "$(account_file sftp "$account")"; sftp_changed=1
           ;;
         ftp)
-          lock_password "$USER"; ftp_changed=1
+          remove_user_and_group "$USER" "$GROUP" ftp; rm -f "$(account_file ftp "$account")" "${STATE_DIR}/vsftpd-users/${USER}"; ftp_changed=1
           ;;
         webdav)
           share="${SHARE:-$(shared_name_from_dir "$ROOT")}"; port="$PORT"
-          rm -f "$(webdav_user_auth_file "$USER")" "${STATE_DIR}/webdav-${USER}.htpasswd"
+          rm -f "$(webdav_user_auth_file "$USER")" "${STATE_DIR}/webdav-${USER}.htpasswd" "$(account_file webdav "$account")"
           refresh_webdav_share "$share"
           if ! find_webdav_share_account "$share" | grep -q .; then set_firewall_port remove "$port"; fi
           ;;
       esac
-      atomic_write_stdin "$marker" 600 <<EOF
-expired_at=$(date +%s)
-EOF
-      log "临时账户已到期并禁用: ${protocol}:${USER}"
+      rm -f "$marker"
+      log "临时账户已到期并被彻底清理: ${protocol}:${USER}"
     done < <(list_accounts "$protocol" || true)
   done
-  [ "$sftp_changed" -eq 0 ] || render_sshd_config
-  [ "$ftp_changed" -eq 0 ] || render_vsftpd_config
+  if [ "$sftp_changed" -eq 1 ]; then
+    load_sftp_service
+    if list_accounts sftp >/dev/null 2>&1; then
+      render_sshd_config
+    else
+      remove_sshd_managed_config
+      set_firewall_port remove "$SFTP_PORT"
+      rm -f "$SFTP_STATE"
+    fi
+  fi
+  if [ "$ftp_changed" -eq 1 ]; then
+    load_ftp_service
+    if list_accounts ftp >/dev/null 2>&1; then
+      render_vsftpd_config
+    else
+      set_firewall_port remove "$FTP_PORT"
+      set_ftp_passive_firewall remove
+      rm -f "$FTP_STATE"
+      restore_original_file /etc/vsftpd.conf vsftpd.conf
+      if [ -f /etc/vsftpd.conf ]; then systemctl restart "$FTP_SERVICE" >/dev/null 2>&1 || true; else systemctl stop "$FTP_SERVICE" 2>/dev/null || true; fi
+    fi
+  fi
 }
 
 install_all_protocols() {
@@ -1836,6 +1856,8 @@ main_menu() {
 main() {
   case "${1:-}" in -h|--help|help) usage; return ;; esac
   require_root
+  exec 9> "/run/${APP}.lock"
+  flock -n 9 || die "配置脚本正在运行中，请不要并发操作。"
   detect_system
   init_state
   case "${1:-}" in
